@@ -1,109 +1,95 @@
 (ns oauth.two
-  (:require [schema.core :as s]
-            [ring.util.codec :as codec]
-            [clojure.walk :as walk]
-            [clojure.string :as str]))
+  (:require [clojure.string :as str]
+            [ring.util.codec :as codec]))
 
-;; -----------------------------------------------------------------------------
-;; Schema
+(set! *warn-on-reflection* true)
 
-(def ^:private Map
-  "Hash-map of keyword or string to any value"
-  {(s/cond-pre s/Keyword s/Str) s/Any})
+(defn- remove-nils [m]
+  (reduce-kv (fn [m k v]
+               (if v m (dissoc m k)))
+    m m))
 
-(def ^:private RequestMethod
-  "Valid HTTP request methods"
-  (s/enum :delete :get :head :patch :post :put :trace))
-
-(def ^:private Request
-  "A clj-http compatible request map that is also OAuth 1.0 compatible."
-  {(s/optional-key :body)    s/Str
-   (s/optional-key :headers) {s/Str s/Str}
-   :request-method           RequestMethod
-   :url                      s/Str})
-
-(def Scope
-  #{s/Str})
-
-(def ClientConfig
-  {(s/optional-key :redirect-uri) s/Str
-   (s/optional-key :scope)        Scope
-   :access-uri                    s/Str
-   :authorize-uri                 s/Str
-   :id                            s/Str
-   :secret                        s/Str})
-
-(def AuthorizationParams
-  {(s/optional-key :redirect-uri) s/Str
-   (s/optional-key :scope)        Scope
-   (s/optional-key :state)        s/Str
-   (s/cond-pre s/Keyword s/Str)   s/Any})
-
-(def TokenRequestParams
-  {(s/optional-key :redirect-uri) s/Str
-   :code                          s/Str})
-
-;; -----------------------------------------------------------------------------
-;; Client
+;;; Client
 
 (defrecord Client [access-uri authorize-uri id secret redirect-uri scope])
 
-(s/defn make-client :- Client
-  [config :- ClientConfig]
+(defn make-client
+  "A simple record of a provider configuration. `config` is a map of:
+
+  - `:access-uri` - URI returning access tokens
+  - `:authorize-uri` - URI to redirect users where they can accept authorization
+  - `:id` - client id/client key
+  - `:secret` - client secret
+  - `:redirect-uri` - (optional) our own uri where we await the user
+  - `:scope` - (optional) if provider needs scope defined"
+  ^Client [config]
+  (assert (and (:access-uri config) (:authorize-uri config)
+               (:id config) (:secret config)))
   (map->Client config))
 
-;; -----------------------------------------------------------------------------
-;; Utils
+;;; Authorization URL
 
-(defn- filter-vals
-  [m]
-  (into {} (filter val m)))
-
-(def ^:private form-encode
-  (comp codec/form-encode filter-vals))
-
-;; -----------------------------------------------------------------------------
-;; Authorization URL
-
-(s/defn join-scope :- (s/maybe s/Str)
-  [scope :- (s/maybe Scope)]
+(defn- join-scope [scope]
   (some->> scope sort (str/join " ")))
 
-(s/defn authorization-url :- s/Str
+(defn authorization-url
+  "Generate authorization URL to redirect user to. Arguments:
+
+  - `client` - a client record (create with `make-client`)
+  - `params` - (optional) a map of:
+    - `:redirect-uri` - (optional) our own uri where we await the user
+    - `:scope` - (optional) scope, if provider needs it to be defined
+    - `:state` - (optional) if you want to pass state across login calls
+  - `more` - (optional) - an arbitrary map of values to put in query string,
+             like Google's `prompt` parameter."
   ([client]        (authorization-url client {}     {}))
   ([client params] (authorization-url client params {}))
-  ([client :- Client params :- AuthorizationParams more :- (s/maybe Map)]
+  ([^Client client params more]
    (str (:authorize-uri client)
-        "?"
-        (form-encode
-         (merge
-          more
-          {"client_id"     (:id client)
-           "redirect_uri"  (or (:redirect-uri params) (:redirect-uri client))
-           "response_type" "code"
-           "scope"         (join-scope (or (:scope params) (:scope client)))
-           "state"         (:state params)})))))
+     "?"
+     (-> (merge
+           more
+           {"client_id"     (:id client)
+            "redirect_uri"  (or (:redirect-uri params) (:redirect-uri client))
+            "response_type" "code"
+            "scope"         (join-scope (or (:scope params) (:scope client)))
+            "state"         (:state params)})
+         remove-nils
+         codec/form-encode))))
 
-;; -----------------------------------------------------------------------------
-;; Access token request
+;;; Access token request
 
-(s/defn basic-auth
+(defn- basic-auth
   [id secret]
-  (codec/base64-encode (.getBytes ^String (str id ":" secret))))
+  (when id
+    (codec/base64-encode (.getBytes (str id ":" secret) "UTF-8"))))
 
-(s/defn access-token-request :- Request
-  [client :- Client params :- TokenRequestParams]
+(defn access-token-request
+  "Generate a request map for `clj-http` to exchange an authorization code for
+   an access token. Arguments:
+
+  - `client` - a client record (create with `make-client`)
+  - `params` - a map of:
+    - `:code` - an authorization code from the provider
+    - `:redirect-uri` - (optional) our own uri where we await the user
+    - `:extra-body` - (optional) an arbitrary map of values to put in a request
+                      body (remember it's form-encoded, not JSON)
+
+  Providers return custom reponses to that request, you have to write handling
+  code for each separately."
+  [^Client client params]
   (assert (:code params))
-  {:request-method :post
-   :url (:access-uri client)
-   :headers
-   (filter-vals
-    {"authorization" (when-let [{:keys [id secret]} client]
-                       (str "Basic " (basic-auth id secret)))
-     "content-type"  "application/x-www-form-urlencoded"})
-   :body
-   (form-encode
-    {"client_id"    (:id client)
-     "code"         (:code params)
-     "grant_type"   "authorization_code"
-     "redirect_uri" (or (:redirect-uri params) (:redirect-uri client))})})
+  (let [basic (basic-auth (:id client) (:secret client))]
+    {:request-method :post
+     :url            (:access-uri client)
+     :headers        (remove-nils
+                       {"content-type"  "application/x-www-form-urlencoded"
+                        "authorization" (some->> basic (str "Basic "))})
+     :body           (-> {"client_id"    (:id client)
+                          "code"         (:code params)
+                          "grant_type"   "authorization_code"
+                          "redirect_uri" (or (:redirect-uri params)
+                                             (:redirect-uri client))}
+                         (into (:extra-body params))
+                         remove-nils
+                         codec/form-encode)}))

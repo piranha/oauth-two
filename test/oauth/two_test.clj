@@ -1,10 +1,7 @@
 (ns oauth.two-test
-  (:require [clojure.test :refer :all]
-            [oauth.two :refer :all]
-            [ring.util.codec :as codec]
-            [schema.test :refer [validate-schemas]]))
-
-(use-fixtures :once validate-schemas)
+  (:require [clojure.test :refer [deftest testing is are]]
+            [oauth.two :as two]
+            [ring.util.codec :as codec]))
 
 ;; -----------------------------------------------------------------------------
 ;; Utils
@@ -33,7 +30,7 @@
    :secret        "client-secret"})
 
 (deftest t-make-valid-client
-  (are [conf] (make-client (merge test-client-config conf))
+  (are [conf] (two/make-client (merge test-client-config conf))
     {:redirect-uri "https://example.com/callback"}
     {:redirect-uri "https://example.com/callback"
      :scope        #{"read" "write"}}
@@ -45,7 +42,7 @@
 
 (defn- make-test-client
   ([]  (make-test-client {}))
-  ([m] (->> m (merge test-client-config) make-client)))
+  ([m] (->> m (merge test-client-config) two/make-client)))
 
 (def ^:private authorization-url-tests
   [{:desc   "with nothing more than a valid client"
@@ -100,7 +97,7 @@
 (deftest t-authorization-url
   (doseq [{:keys [desc client more params query]} authorization-url-tests]
     (is (= query (-> (make-test-client client)
-                     (authorization-url params more)
+                     (two/authorization-url params more)
                      split-url
                      second))
         desc)))
@@ -139,7 +136,7 @@
 (deftest t-access-token-request
   (doseq [{:keys [desc decoded-body client params]} access-token-request-tests
           :let [{:keys [body headers request-method url]}
-                (access-token-request (make-test-client client) params)]]
+                (two/access-token-request (make-test-client client) params)]]
     (testing desc
       (is (= :post request-method))
       (is (= "https://provider.example.com/token" url))
